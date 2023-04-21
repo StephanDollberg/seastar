@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "seastar/util/backtrace.hh"
 #include <seastar/core/resource.hh>
 #include <seastar/core/bitops.hh>
 #include <new>
@@ -382,6 +383,25 @@ public:
     void operator=(scoped_large_allocation_warning_disable&&) = delete;
 };
 
+struct allocation_site {
+    mutable size_t count = 0; // number of live objects allocated at backtrace.
+    mutable size_t size = 0; // amount of bytes in live objects allocated at backtrace.
+    mutable const allocation_site* next = nullptr;
+    simple_backtrace backtrace;
+
+    bool operator==(const allocation_site& o) const {
+        return backtrace == o.backtrace;
+    }
+
+    bool operator!=(const allocation_site& o) const {
+        return !(*this == o);
+    }
+};
+
+/// If memory sampling is on returns the current sampled memory live set
+std::vector<allocation_site> sampled_memory_profile();
+
+// TODO: update for sampling
 /// Enable/disable heap profiling.
 ///
 /// In order to use heap profiling you have to define
@@ -395,6 +415,9 @@ public:
 /// or a zoomable flame graph ([flame graph generation instructions](https://github.com/scylladb/scylla/wiki/Seastar-heap-profiler),
 /// [example flame graph](https://user-images.githubusercontent.com/1389273/72920437-f0cf8a80-3d51-11ea-92f0-f3dbeb698871.png)).
 void set_heap_profiling_enabled(bool);
+
+/// Checks whether heap profiling is currently enabled
+bool get_heap_profiling_enabled();
 
 /// Enable heap profiling for the duration of the scope.
 ///
