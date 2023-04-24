@@ -460,14 +460,16 @@ class small_pool {
     unsigned _min_free;
     unsigned _max_free;
     unsigned _pages_in_use = 0;
+    bool _sampled_pool = false;
     page_list _span_list;
     static constexpr unsigned idx_frac_bits = 2;
 public:
-    explicit small_pool(unsigned object_size) noexcept;
+    explicit small_pool(unsigned object_size, bool is_sampled) noexcept;
     ~small_pool();
     void* allocate();
     void deallocate(void* object);
     unsigned object_size() const { return _object_size; }
+    bool is_sampled_pool() const { return _sampled_pool; }
     bool objects_page_aligned() const { return is_page_aligned(_object_size); }
     static constexpr unsigned size_to_idx(unsigned size);
     static constexpr unsigned idx_to_size(unsigned idx);
@@ -503,6 +505,7 @@ small_pool::size_to_idx(unsigned size) {
             + ((size - 1) >> (log2floor(size) - idx_frac_bits));
 }
 
+template<bool sampled>
 class small_pool_array {
 public:
     static constexpr unsigned nr_small_pools = small_pool::size_to_idx(4 * page_size) + 1;
@@ -511,7 +514,7 @@ private:
         small_pool a[nr_small_pools];
         u() {
             for (unsigned i = 0; i < nr_small_pools; ++i) {
-                new (&a[i]) small_pool(small_pool::idx_to_size(i));
+                new (&a[i]) small_pool(small_pool::idx_to_size(i), sampled);
             }
         }
         ~u() {
@@ -524,7 +527,7 @@ public:
 };
 
 static constexpr size_t max_small_allocation
-    = small_pool::idx_to_size(small_pool_array::nr_small_pools - 1);
+    = small_pool::idx_to_size(small_pool_array<false>::nr_small_pools - 1);
 
 constexpr size_t object_size_with_alloc_site(size_t size, size_t sample_weight) {
     (void) sample_weight;
@@ -574,7 +577,8 @@ struct cpu_pages {
     std::vector<reclaimer*> reclaimers;
     static constexpr unsigned nr_span_lists = 32;
     page_list free_spans[nr_span_lists];  // contains aligned spans with span_size == 2^idx
-    small_pool_array small_pools;
+    small_pool_array<false> small_pools;
+    small_pool_array<true> sampled_small_pools;
     alignas(seastar::cache_line_size) std::atomic<cross_cpu_free_item*> xcpu_freelist;
     static std::atomic<unsigned> cpu_id_gen;
     static cpu_pages* all_cpus[max_cpus];
@@ -841,6 +845,9 @@ cpu_pages::allocate_large_and_trim(unsigned n_pages, size_t sample_weight) {
         auto alloc_site = add_alloc_site(span->span_size * page_size);
         span->alloc_site = alloc_site;
     }
+    else {
+        span->alloc_site = nullptr;
+    }
 #endif
     maybe_reclaim();
     return mem() + span_idx * page_size;
@@ -858,7 +865,7 @@ cpu_pages::add_alloc_site(size_t allocated_size) {
     allocation_site_ptr alloc_site = get_allocation_site();
     if (alloc_site) {
         ++alloc_site->count;
-        alloc_site->size += allocated_size;
+        alloc_site->size += std::max(sampler.sampling_interval(), allocated_size);
     }
 
     return alloc_site;
@@ -868,7 +875,7 @@ void
 cpu_pages::remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_size) {
     if (alloc_site) {
         --alloc_site->count;
-        alloc_site->size -= deallocated_size;
+        alloc_site->size -= std::max(sampler.sampling_interval(), deallocated_size);
         if (alloc_site->count == 0)
         {
             asu.alloc_sites.erase(*alloc_site);
@@ -922,6 +929,7 @@ allocation_site_ptr get_allocation_site() {
     if (!cpu_mem.is_initialized() || !cpu_mem.sampler.sampling_interval()) {
         return nullptr;
     }
+    // TODO: limit size of alloc_sites
     disable_backtrace_temporarily dbt;
     allocation_site new_alloc_site;
     new_alloc_site.backtrace = get_backtrace();
@@ -950,16 +958,23 @@ small_pool::alloc_site_holder(void* ptr) {
 void*
 cpu_pages::allocate_small(unsigned size, size_t sample_weight) {
     auto idx = small_pool::size_to_idx(size);
-    auto& pool = small_pools[idx];
-    assert(size <= pool.object_size());
-    auto ptr = pool.allocate();
+    void* ptr;
 #ifdef SEASTAR_HEAPPROF
-    if (sample_weight && ptr)
+    if (sample_weight)
     {
+        auto& pool = sampled_small_pools[idx];
+        assert(size <= pool.object_size());
+        ptr = pool.allocate();
         auto alloc_site = add_alloc_site(pool.object_size());
         new (&pool.alloc_site_holder(ptr)) allocation_site_ptr{alloc_site};
     }
+    else
 #endif
+    {
+        auto& pool = small_pools[idx];
+        assert(size <= pool.object_size());
+        ptr = pool.allocate();
+    }
     return ptr;
 }
 
@@ -967,7 +982,7 @@ void cpu_pages::free_large(void* ptr) {
     pageidx idx = (reinterpret_cast<char*>(ptr) - mem()) / page_size;
     page* span = &pages[idx];
 #ifdef SEASTAR_HEAPPROF
-    if (get_heap_profiling_enabled())
+    if (span->alloc_site)
     {
         auto alloc_site = span->alloc_site;
         remove_alloc_site(alloc_site, span->span_size * page_size);
@@ -981,7 +996,7 @@ size_t cpu_pages::object_size(void* ptr) {
     if (span->pool) {
         auto s = span->pool->object_size();
 #ifdef SEASTAR_HEAPPROF
-        if (get_heap_profiling_enabled())
+        if (span->pool->is_sampled_pool())
         {
             // We must not allow the object to be extended onto the allocation_site_ptr field.
             if (!span->pool->objects_page_aligned()) {
@@ -1029,7 +1044,7 @@ void cpu_pages::free(void* ptr) {
     if (span->pool) {
         small_pool& pool = *span->pool;
 #ifdef SEASTAR_HEAPPROF
-        if (get_heap_profiling_enabled())
+        if (pool.is_sampled_pool())
         {
             allocation_site_ptr alloc_site = pool.alloc_site_holder(ptr);
             remove_alloc_site(alloc_site, pool.object_size());
@@ -1042,27 +1057,25 @@ void cpu_pages::free(void* ptr) {
 }
 
 void cpu_pages::free(void* ptr, size_t size) {
+#ifdef SEASTAR_HEAPPROF
+    // sized free can avoid accessing the `page` structure as an optimization.
+    // With memory sampling we always need to check the pool though to see
+    // whether this allocation was sampled. Hence, just defer to the non-sized
+    // implementation
+    (void) size;
+    free(ptr);
+#else
     // match action on allocate() so hit the right pool
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
     }
     if (size <= max_small_allocation) {
-        size = object_size_with_alloc_site(size, get_heap_profiling_enabled());
         auto pool = &small_pools[small_pool::size_to_idx(size)];
-#ifdef SEASTAR_HEAPPROF
-        if (get_heap_profiling_enabled())
-        {
-            allocation_site_ptr alloc_site = pool->alloc_site_holder(ptr);
-            if (alloc_site) {
-                --alloc_site->count;
-                alloc_site->size -= pool->object_size();
-            }
-        }
-#endif
         pool->deallocate(ptr);
     } else {
         free_large(ptr);
     }
+#endif
 }
 
 bool
@@ -1099,7 +1112,7 @@ void cpu_pages::shrink(void* ptr, size_t new_size) {
         return;
     }
 #ifdef SEASTAR_HEAPPROF
-    if (get_heap_profiling_enabled())
+    if (span->alloc_site)
     {
         auto alloc_site = span->alloc_site;
         if (alloc_site) {
@@ -1299,8 +1312,8 @@ void cpu_pages::set_min_free_pages(size_t pages) {
     maybe_reclaim();
 }
 
-small_pool::small_pool(unsigned object_size) noexcept
-    : _object_size(object_size) {
+small_pool::small_pool(unsigned object_size, bool is_sampled) noexcept
+    : _object_size(object_size), _sampled_pool(is_sampled) {
     unsigned span_size = 1;
     auto span_bytes = [&] { return span_size * page_size; };
     auto waste = [&] { return (span_bytes() % _object_size) / (1.0 * span_bytes()); };
@@ -1330,6 +1343,7 @@ small_pool::small_pool(unsigned object_size) noexcept
 
     _max_free = std::max<unsigned>(100, span_bytes() * 2 / _object_size);
     _min_free = _max_free / 2;
+    _free = nullptr;
 }
 
 small_pool::~small_pool() {
