@@ -138,6 +138,7 @@ __thread volatile int critical_alloc_section = 0;
 #include <seastar/core/posix.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <new>
+#include <random>
 #include <cstdint>
 #include <algorithm>
 #include <limits>
@@ -244,6 +245,76 @@ static uint64_t get(types stat_type)
 }
 
 }
+
+// Taken from
+// https://cs.android.com/android/platform/superproject/+/master:external/perfetto/src/profiling/memory/sampler.h
+// See: https://perfetto.dev/docs/design-docs/heapprofd-sampling for the background
+//
+// Note there is a few differences for how we use this. Right now we don't
+// respect the samplesize/weight that we return here. The reason is that that
+// would require storing the weight in addition to the alloation site ptr as on
+// free we need to know how much a sample accounted for. Hence, for now we
+// simple always use the sample frequency.
+class Sampler {
+public:
+    Sampler() : random_gen(rd_device()) {}
+    void SetSamplingInterval(uint64_t sampling_interval) {
+        sampling_interval_ = sampling_interval;
+        if (sampling_interval_ == 0)
+        {
+            return;
+        }
+        sampling_rate_ = 1.0 / static_cast<double>(sampling_interval_);
+        interval_to_next_sample_ = NextSampleInterval();
+    }
+
+    // Returns number of bytes that should be be attributed to the sample.
+    // If returned size is 0, the allocation should not be sampled.
+    //
+    // Due to how the poission sampling works, some samples should be accounted
+    // multiple times.
+    size_t SampleSize(size_t alloc_sz) {
+        // Below removed here as we do the same in `add_alloc_site`
+        // if (PERFETTO_UNLIKELY(alloc_sz >= sampling_interval_))
+        //     return alloc_sz;
+        if (sampling_interval_ == 0)
+        {
+            return 0;
+        }
+        return static_cast<size_t>(sampling_interval_ * NumberOfSamples(alloc_sz));
+    }
+
+    uint64_t sampling_interval() const { return sampling_interval_; }
+
+private:
+    int64_t NextSampleInterval() {
+        std::exponential_distribution<double> dist(sampling_rate_);
+        int64_t next = static_cast<int64_t>(dist(random_gen));
+        // We approximate the geometric distribution using an exponential
+        // distribution.
+        // We need to add 1 because that gives us the number of failures before
+        // the next success, while our interval includes the next success.
+        return next + 1;
+    }
+
+    // Returns number of times a sample should be accounted. Due to how the
+    // poission sampling works, some samples should be accounted multiple times.
+    size_t NumberOfSamples(size_t alloc_sz) {
+        interval_to_next_sample_ -= alloc_sz;
+        size_t num_samples = 0;
+        while (interval_to_next_sample_ <= 0) {
+            interval_to_next_sample_ += NextSampleInterval();
+            ++num_samples;
+        }
+        return num_samples;
+    }
+
+    std::random_device rd_device;
+    std::mt19937_64 random_gen;
+    uint64_t sampling_interval_;
+    double sampling_rate_;
+    int64_t interval_to_next_sample_;
+};
 
 // original memory allocator support
 // note: allocations before calling the constructor would use seastar allocator
@@ -455,13 +526,13 @@ public:
 static constexpr size_t max_small_allocation
     = small_pool::idx_to_size(small_pool_array::nr_small_pools - 1);
 
-constexpr size_t object_size_with_alloc_site(size_t size, bool is_sampled) {
-    (void) is_sampled;
+constexpr size_t object_size_with_alloc_site(size_t size, size_t sample_weight) {
+    (void) sample_weight;
 #ifdef SEASTAR_HEAPPROF
     // For page-aligned sizes, allocation_site* lives in page::alloc_site, not with the object.
     static_assert(is_page_aligned(max_small_allocation), "assuming that max_small_allocation is page aligned so that we"
             " don't need to add allocation_site_ptr to objects of size close to it");
-    if (is_sampled)
+    if (sample_weight)
     {
         size_t next_page_aligned_size = next_page_aligned(size);
         if (next_page_aligned_size - size > sizeof(allocation_site_ptr)) {
@@ -515,7 +586,9 @@ struct cpu_pages {
         alloc_sites_type alloc_sites;
     } asu;
     allocation_site_ptr alloc_site_list_head = nullptr; // For easy traversal of asu.alloc_sites from scylla-gdb.py
-    bool collect_backtrace = false;
+    // bool collect_backtrace = false;
+    Sampler sampler;
+
     char* mem() { return memory; }
 
     void link(page_list& list, page* span);
@@ -525,9 +598,9 @@ struct cpu_pages {
         unsigned nr_pages;
     };
     void maybe_reclaim();
-    void* allocate_large_and_trim(unsigned nr_pages);
-    void* allocate_large(unsigned nr_pages);
-    void* allocate_large_aligned(unsigned align_pages, unsigned nr_pages);
+    void* allocate_large_and_trim(unsigned nr_pages, size_t sample_weight);
+    void* allocate_large(unsigned nr_pages, size_t sample_weight);
+    void* allocate_large_aligned(unsigned align_pages, unsigned nr_pages, size_t sample_weight);
     page* find_and_unlink_span(unsigned nr_pages);
     page* find_and_unlink_span_reclaiming(unsigned n_pages);
     void free_large(void* ptr);
@@ -535,7 +608,7 @@ struct cpu_pages {
     void free_span(pageidx start, uint32_t nr_pages);
     void free_span_no_merge(pageidx start, uint32_t nr_pages);
     void free_span_unaligned(pageidx start, uint32_t nr_pages);
-    void* allocate_small(unsigned size);
+    void* allocate_small(unsigned size, size_t sample_weight);
     void free(void* ptr);
     void free(void* ptr, size_t size);
     static bool try_foreign_free(void* ptr);
@@ -560,6 +633,7 @@ struct cpu_pages {
     void warn_large_allocation(size_t size);
     allocation_site_ptr add_alloc_site(size_t allocated_size);
     void remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_size);
+    size_t should_sample(size_t size);
     memory::memory_layout memory_layout();
     ~cpu_pages();
 };
@@ -572,47 +646,47 @@ static cpu_pages& get_cpu_mem();
 
 #ifdef SEASTAR_HEAPPROF
 
-void set_heap_profiling_enabled(bool enable) {
-    bool is_enabled = get_cpu_mem().collect_backtrace;
-    if (enable) {
-        if (!is_enabled) {
+void set_heap_profiling_enabled(size_t sample_every) {
+    bool current_sample_every = get_cpu_mem().sampler.sampling_interval();
+    if (sample_every) {
+        if (!current_sample_every) {
             seastar_logger.info("Enabling heap profiler");
         }
     } else {
-        if (is_enabled) {
+        if (current_sample_every) {
             seastar_logger.info("Disabling heap profiler");
         }
     }
-    get_cpu_mem().collect_backtrace = enable;
+    get_cpu_mem().sampler.SetSamplingInterval(sample_every);
 }
 
-bool get_heap_profiling_enabled() {
-    return get_cpu_mem().collect_backtrace;
+size_t get_heap_profiling_enabled() {
+    return get_cpu_mem().sampler.sampling_interval();
 }
 
 static thread_local int64_t scoped_heap_profiling_embed_count = 0;
 
 scoped_heap_profiling::scoped_heap_profiling() noexcept {
     ++scoped_heap_profiling_embed_count;
-    set_heap_profiling_enabled(true);
+    set_heap_profiling_enabled(1);
 }
 
 scoped_heap_profiling::~scoped_heap_profiling() {
     if (!--scoped_heap_profiling_embed_count) {
-        set_heap_profiling_enabled(false);
+        set_heap_profiling_enabled(0);
     }
 }
 
 #else
 
-void set_heap_profiling_enabled(bool enable) {
+void set_heap_profiling_enabled(size_t enable) {
     seastar_logger.warn("Seastar compiled without heap profiling support, heap profiler not supported;"
             " compile with the Seastar_HEAP_PROFILING=ON CMake option to add heap profiling support");
 }
 
-bool get_heap_profiling_enabled() {
+size_t get_heap_profiling_enabled() {
     // don't log here, called on all paths
-    return false;
+    return 0;
 }
 
 scoped_heap_profiling::scoped_heap_profiling() noexcept {
@@ -739,7 +813,7 @@ void cpu_pages::maybe_reclaim() {
 }
 
 void*
-cpu_pages::allocate_large_and_trim(unsigned n_pages) {
+cpu_pages::allocate_large_and_trim(unsigned n_pages, size_t sample_weight) {
     // Avoid exercising the reclaimers for requests we'll not be able to satisfy
     // nr_pages might be zero during startup, so check for that too
     if (nr_pages && n_pages >= nr_pages) {
@@ -762,7 +836,7 @@ cpu_pages::allocate_large_and_trim(unsigned n_pages) {
     span->span_size = span_end->span_size = span_size;
     span->pool = nullptr;
 #ifdef SEASTAR_HEAPPROF
-    if (get_heap_profiling_enabled())
+    if (sample_weight)
     {
         auto alloc_site = add_alloc_site(span->span_size * page_size);
         span->alloc_site = alloc_site;
@@ -802,6 +876,11 @@ cpu_pages::remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_
     }
 }
 
+size_t
+cpu_pages::should_sample(size_t size) {
+    return sampler.SampleSize(size);
+}
+
 void
 inline
 cpu_pages::check_large_allocation(size_t size) {
@@ -811,25 +890,25 @@ cpu_pages::check_large_allocation(size_t size) {
 }
 
 void*
-cpu_pages::allocate_large(unsigned n_pages) {
+cpu_pages::allocate_large(unsigned n_pages, size_t sample_weight) {
     check_large_allocation(n_pages * page_size);
-    return allocate_large_and_trim(n_pages);
+    return allocate_large_and_trim(n_pages, sample_weight);
 }
 
 void*
-cpu_pages::allocate_large_aligned(unsigned align_pages, unsigned n_pages) {
+cpu_pages::allocate_large_aligned(unsigned align_pages, unsigned n_pages, size_t sample_weight) {
     check_large_allocation(n_pages * page_size);
     // buddy allocation is always aligned
-    return allocate_large_and_trim(n_pages);
+    return allocate_large_and_trim(n_pages, sample_weight);
 }
 
 disable_backtrace_temporarily::disable_backtrace_temporarily() {
-    _old = get_cpu_mem().collect_backtrace;
-    get_cpu_mem().collect_backtrace = false;
+    _old = get_cpu_mem().sampler.sampling_interval();
+    get_cpu_mem().sampler.SetSamplingInterval(0);
 }
 
 disable_backtrace_temporarily::~disable_backtrace_temporarily() {
-    get_cpu_mem().collect_backtrace = _old;
+    get_cpu_mem().sampler.SetSamplingInterval(_old);
 }
 
 static
@@ -840,7 +919,7 @@ simple_backtrace get_backtrace() noexcept {
 
 static
 allocation_site_ptr get_allocation_site() {
-    if (!cpu_mem.is_initialized() || !cpu_mem.collect_backtrace) {
+    if (!cpu_mem.is_initialized() || !cpu_mem.sampler.sampling_interval()) {
         return nullptr;
     }
     disable_backtrace_temporarily dbt;
@@ -869,13 +948,13 @@ small_pool::alloc_site_holder(void* ptr) {
 #endif
 
 void*
-cpu_pages::allocate_small(unsigned size) {
+cpu_pages::allocate_small(unsigned size, size_t sample_weight) {
     auto idx = small_pool::size_to_idx(size);
     auto& pool = small_pools[idx];
     assert(size <= pool.object_size());
     auto ptr = pool.allocate();
 #ifdef SEASTAR_HEAPPROF
-    if (get_heap_profiling_enabled() && ptr)
+    if (sample_weight && ptr)
     {
         auto alloc_site = add_alloc_site(pool.object_size());
         new (&pool.alloc_site_holder(ptr)) allocation_site_ptr{alloc_site};
@@ -1130,7 +1209,7 @@ void cpu_pages::do_resize(size_t new_size, allocate_system_memory_fn alloc_sys_m
     // one past last page structure is a sentinel
     auto new_page_array_pages = align_up(sizeof(page[new_pages + 1]), page_size) / page_size;
     auto new_page_array
-        = reinterpret_cast<page*>(allocate_large(new_page_array_pages));
+        = reinterpret_cast<page*>(allocate_large(new_page_array_pages, false));
     if (!new_page_array) {
         throw std::bad_alloc();
     }
@@ -1304,10 +1383,10 @@ small_pool::add_more_objects() {
     while (_free_count < goal) {
         disable_backtrace_temporarily dbt;
         auto span_size = _span_sizes.preferred;
-        auto data = reinterpret_cast<char*>(get_cpu_mem().allocate_large(span_size));
+        auto data = reinterpret_cast<char*>(get_cpu_mem().allocate_large(span_size, false));
         if (!data) {
             span_size = _span_sizes.fallback;
-            data = reinterpret_cast<char*>(get_cpu_mem().allocate_large(span_size));
+            data = reinterpret_cast<char*>(get_cpu_mem().allocate_large(span_size, false));
             if (!data) {
                 return;
             }
@@ -1362,21 +1441,21 @@ abort_on_underflow(size_t size) {
     }
 }
 
-void* allocate_large(size_t size) {
+void* allocate_large(size_t size, bool should_sample) {
     abort_on_underflow(size);
     unsigned size_in_pages = (size + page_size - 1) >> page_bits;
     if ((size_t(size_in_pages) << page_bits) < size) {
         return nullptr; // (size + page_size - 1) caused an overflow
     }
-    return get_cpu_mem().allocate_large(size_in_pages);
+    return get_cpu_mem().allocate_large(size_in_pages, should_sample);
 
 }
 
-void* allocate_large_aligned(size_t align, size_t size) {
+void* allocate_large_aligned(size_t align, size_t size, bool should_sample) {
     abort_on_underflow(size);
     unsigned size_in_pages = (size + page_size - 1) >> page_bits;
     unsigned align_in_pages = std::max(align, page_size) >> page_bits;
-    return get_cpu_mem().allocate_large_aligned(align_in_pages, size_in_pages);
+    return get_cpu_mem().allocate_large_aligned(align_in_pages, size_in_pages, should_sample);
 }
 
 void free_large(void* ptr) {
@@ -1424,12 +1503,13 @@ void* allocate(size_t size) {
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
     }
+    size_t sample_weight = get_cpu_mem().should_sample(size);
     void* ptr;
     if (size <= max_small_allocation) {
-        size = object_size_with_alloc_site(size, get_heap_profiling_enabled());
-        ptr = get_cpu_mem().allocate_small(size);
+        size = object_size_with_alloc_site(size, sample_weight);
+        ptr = get_cpu_mem().allocate_small(size, sample_weight);
     } else {
-        ptr = allocate_large(size);
+        ptr = allocate_large(size, sample_weight);
     }
     if (!ptr) {
         on_allocation_failure(size);
@@ -1455,14 +1535,16 @@ void* allocate_aligned(size_t align, size_t size) {
     if (size <= sizeof(free_object)) {
         size = std::max(sizeof(free_object), align);
     }
+    // TODO: do we want to consider alignment here?
+    bool should_sample = get_cpu_mem().should_sample(size);
     void* ptr;
     if (size <= max_small_allocation && align <= page_size) {
         // Our small allocator only guarantees alignment for power-of-two
         // allocations which are not larger than a page.
-        size = 1 << log2ceil(object_size_with_alloc_site(size, get_heap_profiling_enabled()));
-        ptr = get_cpu_mem().allocate_small(size);
+        size = 1 << log2ceil(object_size_with_alloc_site(size, should_sample));
+        ptr = get_cpu_mem().allocate_small(size, should_sample);
     } else {
-        ptr = allocate_large_aligned(align, size);
+        ptr = allocate_large_aligned(align, size, should_sample);
     }
     if (!ptr) {
         on_allocation_failure(size);

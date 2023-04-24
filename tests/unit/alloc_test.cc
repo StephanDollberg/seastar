@@ -316,7 +316,7 @@ SEASTAR_TEST_CASE(test_diagnostics_allocation) {
 SEASTAR_TEST_CASE(test_sampled_profile_collection)
 {
     BOOST_REQUIRE(!seastar::memory::get_heap_profiling_enabled());
-    seastar::memory::set_heap_profiling_enabled(true);
+    seastar::memory::set_heap_profiling_enabled(100);
     BOOST_REQUIRE(seastar::memory::get_heap_profiling_enabled());
 
     {
@@ -341,7 +341,7 @@ SEASTAR_TEST_CASE(test_sampled_profile_collection)
     }
 
     // Needed for now because we can't differentiate between sampled allocations and non-sampled ones
-    seastar::memory::set_heap_profiling_enabled(false);
+    seastar::memory::set_heap_profiling_enabled(0);
 
     return seastar::make_ready_future();
 }
