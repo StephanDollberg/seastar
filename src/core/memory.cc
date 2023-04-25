@@ -878,6 +878,22 @@ cpu_pages::remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_
         alloc_site->size -= std::max(sampler.sampling_interval(), deallocated_size);
         if (alloc_site->count == 0)
         {
+            // lame: do better or fix the gdb script
+            if (cpu_mem.alloc_site_list_head == alloc_site)
+            {
+                cpu_mem.alloc_site_list_head = alloc_site->next;
+            }
+            else {
+                for (auto& ele : asu.alloc_sites)
+                {
+                    if (ele.next == alloc_site)
+                    {
+                        ele.next = alloc_site->next;
+                        break;
+                    }
+                }
+            }
+
             asu.alloc_sites.erase(*alloc_site);
         }
     }
