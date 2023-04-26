@@ -161,7 +161,7 @@ struct allocation_site {
     mutable size_t count = 0; // number of live objects allocated at backtrace.
     mutable size_t size = 0; // amount of bytes in live objects allocated at backtrace.
     mutable const allocation_site* next = nullptr;
-    saved_backtrace backtrace;
+    simple_backtrace backtrace;
 
     bool operator==(const allocation_site& o) const {
         return backtrace == o.backtrace;
@@ -179,7 +179,7 @@ namespace std {
 template<>
 struct hash<seastar::allocation_site> {
     size_t operator()(const seastar::allocation_site& bi) const {
-        return std::hash<seastar::saved_backtrace>()(bi.backtrace);
+        return std::hash<seastar::simple_backtrace>()(bi.backtrace);
     }
 };
 
@@ -812,9 +812,9 @@ disable_backtrace_temporarily::~disable_backtrace_temporarily() {
 }
 
 static
-saved_backtrace get_backtrace() noexcept {
+simple_backtrace get_backtrace() noexcept {
     disable_backtrace_temporarily dbt;
-    return current_backtrace();
+    return current_backtrace_tasklocal();
 }
 
 static
