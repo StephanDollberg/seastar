@@ -156,18 +156,6 @@ __thread volatile int critical_alloc_section = 0;
 #include <numaif.h>
 #endif
 
-
-namespace std {
-
-template<>
-struct hash<seastar::memory::allocation_site> {
-    size_t operator()(const seastar::memory::allocation_site& bi) const {
-        return std::hash<seastar::simple_backtrace>()(bi.backtrace);
-    }
-};
-
-}
-
 #if FMT_VERSION >= 90000
 namespace seastar::memory {
 struct human_readable_value;

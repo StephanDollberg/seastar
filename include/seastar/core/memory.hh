@@ -431,3 +431,14 @@ public:
 
 }
 }
+
+namespace std {
+
+template<>
+struct hash<seastar::memory::allocation_site> {
+    size_t operator()(const seastar::memory::allocation_site& bi) const {
+        return std::hash<seastar::simple_backtrace>()(bi.backtrace);
+    }
+};
+
+}
