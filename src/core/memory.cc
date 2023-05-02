@@ -1603,10 +1603,14 @@ void free_aligned(void* obj, size_t align, size_t size) {
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
     }
+#ifndef SEASTAR_HEAPPROF
+    // See comment in the sized-free implementation below. With heap profiling we
+    // can skip this as sized-free defers to non-sized-free
     if (size <= max_small_allocation && align <= page_size) {
         // Same adjustment as allocate_aligned()
-        size = 1 << log2ceil(object_size_with_alloc_site(size, get_heap_profiling_enabled()));
+        size = 1 << log2ceil(size);
     }
+#endif
     free(obj, size);
 }
 
