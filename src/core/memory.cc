@@ -517,35 +517,27 @@ public:
 static constexpr size_t max_small_allocation
     = small_pool::idx_to_size(small_pool_array<false>::nr_small_pools - 1);
 
-constexpr size_t object_size_with_alloc_site(size_t size, size_t sample_weight) {
-    (void) sample_weight;
 #ifdef SEASTAR_HEAPPROF
+constexpr size_t object_size_with_alloc_site(size_t size) {
     // For page-aligned sizes, allocation_site* lives in page::alloc_site, not with the object.
     static_assert(is_page_aligned(max_small_allocation), "assuming that max_small_allocation is page aligned so that we"
             " don't need to add allocation_site_ptr to objects of size close to it");
-    if (sample_weight)
-    {
-        size_t next_page_aligned_size = next_page_aligned(size);
-        if (next_page_aligned_size - size > sizeof(allocation_site_ptr)) {
-            size += sizeof(allocation_site_ptr);
-        } else {
-            return next_page_aligned_size;
-        }
+    size_t next_page_aligned_size = next_page_aligned(size);
+    if (next_page_aligned_size - size > sizeof(allocation_site_ptr)) {
+        size += sizeof(allocation_site_ptr);
+    } else {
+        return next_page_aligned_size;
     }
-#endif
     return size;
 }
 
-#ifdef SEASTAR_HEAPPROF
 // Ensure that object_size_with_alloc_site() does not exceed max_small_allocation
-static_assert(object_size_with_alloc_site(max_small_allocation, true) == max_small_allocation, "");
-static_assert(object_size_with_alloc_site(max_small_allocation - 1, true) == max_small_allocation, "");
-static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr) + 1, true) == max_small_allocation, "");
-static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr), true) == max_small_allocation, "");
-static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr) - 1, true) == max_small_allocation - 1, "");
-static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr) - 2, true) == max_small_allocation - 2, "");
-// Sanity check that non-sampled doesn't change size
-static_assert(object_size_with_alloc_site(8, false) == 8, "");
+static_assert(object_size_with_alloc_site(max_small_allocation) == max_small_allocation, "");
+static_assert(object_size_with_alloc_site(max_small_allocation - 1) == max_small_allocation, "");
+static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr) + 1) == max_small_allocation, "");
+static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr)) == max_small_allocation, "");
+static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr) - 1) == max_small_allocation - 1, "");
+static_assert(object_size_with_alloc_site(max_small_allocation - sizeof(allocation_site_ptr) - 2) == max_small_allocation - 2, "");
 #endif
 
 struct cross_cpu_free_item {
@@ -600,7 +592,6 @@ struct cpu_pages {
     void free_span(pageidx start, uint32_t nr_pages);
     void free_span_no_merge(pageidx start, uint32_t nr_pages);
     void free_span_unaligned(pageidx start, uint32_t nr_pages);
-    void* allocate_small(unsigned size, size_t sample_weight);
     void free(void* ptr);
     void free(void* ptr, size_t size);
     static bool try_foreign_free(void* ptr);
@@ -966,29 +957,6 @@ small_pool::alloc_site_holder(void* ptr) {
 }
 
 #endif
-
-void*
-cpu_pages::allocate_small(unsigned size, size_t sample_weight) {
-    auto idx = small_pool::size_to_idx(size);
-    void* ptr;
-#ifdef SEASTAR_HEAPPROF
-    if (sample_weight)
-    {
-        auto& pool = sampled_small_pools[idx];
-        assert(size <= pool.object_size());
-        ptr = pool.allocate();
-        auto alloc_site = add_alloc_site(pool.object_size());
-        new (&pool.alloc_site_holder(ptr)) allocation_site_ptr{alloc_site};
-    }
-    else
-#endif
-    {
-        auto& pool = small_pools[idx];
-        assert(size <= pool.object_size());
-        ptr = pool.allocate();
-    }
-    return ptr;
-}
 
 void cpu_pages::free_large(void* ptr) {
     pageidx idx = (reinterpret_cast<char*>(ptr) - mem()) / page_size;
@@ -1516,6 +1484,40 @@ static inline cpu_pages& get_cpu_mem()
 static constexpr int debug_allocation_pattern = 0xab;
 #endif
 
+enum class alignment_t { aligned, unaligned };
+
+#ifdef SEASTAR_HEAPPROF
+template<alignment_t alignment>
+void* allocate_from_sampled_small_pool(size_t size) {
+    size = object_size_with_alloc_site(size);
+    if constexpr (alignment == alignment_t::aligned)
+    {
+        size = 1 << log2ceil(size);
+    }
+    auto idx = small_pool::size_to_idx(size);
+    auto& pool = get_cpu_mem().sampled_small_pools[idx];
+    assert(size <= pool.object_size());
+    void* ptr = pool.allocate();
+    auto alloc_site = get_cpu_mem().add_alloc_site(pool.object_size());
+    new (&pool.alloc_site_holder(ptr)) allocation_site_ptr{alloc_site};
+    return ptr;
+}
+
+#endif
+
+template<alignment_t alignment>
+void* allocate_from_small_pool(size_t size)
+{
+    if constexpr (alignment == alignment_t::aligned)
+    {
+        size = 1 << log2ceil(size);
+    }
+    auto idx = small_pool::size_to_idx(size);
+    auto& pool = get_cpu_mem().small_pools[idx];
+    assert(size <= pool.object_size());
+    return pool.allocate();
+}
+
 void* allocate(size_t size) {
     if (!is_reactor_thread) {
         if (original_malloc_func) {
@@ -1532,8 +1534,16 @@ void* allocate(size_t size) {
     size_t sample_weight = get_cpu_mem().should_sample(size);
     void* ptr;
     if (size <= max_small_allocation) {
-        size = object_size_with_alloc_site(size, sample_weight);
-        ptr = get_cpu_mem().allocate_small(size, sample_weight);
+#ifdef SEASTAR_HEAPPROF
+        if (sample_weight)
+        {
+            ptr = allocate_from_sampled_small_pool<alignment_t::unaligned>(size);
+        }
+        else
+#endif
+        {
+            ptr = allocate_from_small_pool<alignment_t::unaligned>(size);
+        }
     } else {
         ptr = allocate_large(size, sample_weight);
     }
@@ -1561,14 +1571,21 @@ void* allocate_aligned(size_t align, size_t size) {
     if (size <= sizeof(free_object)) {
         size = std::max(sizeof(free_object), align);
     }
-    // TODO: do we want to consider alignment here?
     bool should_sample = get_cpu_mem().should_sample(size);
     void* ptr;
     if (size <= max_small_allocation && align <= page_size) {
         // Our small allocator only guarantees alignment for power-of-two
         // allocations which are not larger than a page.
-        size = 1 << log2ceil(object_size_with_alloc_site(size, should_sample));
-        ptr = get_cpu_mem().allocate_small(size, should_sample);
+#ifdef SEASTAR_HEAPPROF
+        if (should_sample)
+        {
+            ptr = allocate_from_sampled_small_pool<alignment_t::aligned>(size);
+        }
+        else
+#endif
+        {
+            ptr = allocate_from_small_pool<alignment_t::aligned>(size);
+        }
     } else {
         ptr = allocate_large_aligned(align, size, should_sample);
     }
