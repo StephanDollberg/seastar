@@ -383,11 +383,15 @@ public:
     void operator=(scoped_large_allocation_warning_disable&&) = delete;
 };
 
+/// Describes an allocation location in the code.  The location is identified by
+/// its backtrace. One allocation_site can represent many allocations at the
+/// same location. `count` and `size` represent the cumulative sum of all
+/// allocations at the location.
 struct allocation_site {
     mutable size_t count = 0; // number of live objects allocated at backtrace.
     mutable size_t size = 0; // amount of bytes in live objects allocated at backtrace.
-    mutable const allocation_site* next = nullptr;
-    simple_backtrace backtrace;
+    mutable const allocation_site* next = nullptr; // TODO: remove
+    simple_backtrace backtrace; // call site for this allocation
 
     bool operator==(const allocation_site& o) const {
         return backtrace == o.backtrace;
