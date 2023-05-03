@@ -234,48 +234,89 @@ static uint64_t get(types stat_type)
 
 }
 
-// Taken from
+// Inspired from
 // https://cs.android.com/android/platform/superproject/+/master:external/perfetto/src/profiling/memory/sampler.h
 // See: https://perfetto.dev/docs/design-docs/heapprofd-sampling for the background
 //
-// Note there is a few differences for how we use this. Right now we don't
-// respect the samplesize/weight that we return here. The reason is that that
-// would require storing the weight in addition to the alloation site ptr as on
-// free we need to know how much a sample accounted for. Hence, for now we
-// simple always use the sample frequency.
-class Sampler {
+// Note there is a difference in how we use this. Right now we don't
+// account for samples multiple times (in case we have multiple loops of drawing
+// from the exp distribution). The reason is that that would require storing the
+// weight in addition to the alloation site ptr as on free we need to know how
+// much a sample accounted for. Hence, for now we simple always use the sampling
+// interval.
+class sampler {
 public:
-    Sampler() : random_gen(rd_device()) {}
-    void SetSamplingInterval(uint64_t sampling_interval) {
+    sampler() : random_gen(rd_device()) {
+        set_sampling_interval(0);
+    }
+    /// Sets the sampling interval in bytes. Setting it to 0 means to never sample
+    void set_sampling_interval(uint64_t sampling_interval) {
         sampling_interval_ = sampling_interval;
         if (sampling_interval_ == 0)
         {
+            // Set the interval very large. This means in practice we will
+            // likely never get this below zero and hence it's unlikely we will
+            // ever have to run the reset path with sampling off
+            interval_to_next_sample_ = std::numeric_limits<int64_t>::max();
             return;
         }
         sampling_rate_ = 1.0 / static_cast<double>(sampling_interval_);
-        interval_to_next_sample_ = NextSampleInterval();
+        interval_to_next_sample_ = next_sampling_interval();
     }
-
-    // Returns number of bytes that should be be attributed to the sample.
-    // If returned size is 0, the allocation should not be sampled.
-    //
-    // Due to how the poission sampling works, some samples should be accounted
-    // multiple times.
-    size_t SampleSize(size_t alloc_sz) {
-        // Below removed here as we do the same in `add_alloc_site`
-        // if (PERFETTO_UNLIKELY(alloc_sz >= sampling_interval_))
-        //     return alloc_sz;
+    /// Returns true if this allocation of size `alloc_size` should be sampled
+    bool should_sample(size_t alloc_size) {
+        // We need to check the sampling_interval as 0 means off. Also we need
+        // to check whether this allocation has brought the interval
+        // below/to 0. We chose to check the interval_to_next_sample first. If
+        // heap profiling is compiled in it's likely we are using it as well.
+        // Hence, lets do the interval decrement and check first and only check
+        // whether sampling is off after.
+        interval_to_next_sample_ -= alloc_size;
+        if (interval_to_next_sample_ > 0)
+        {
+            return false;
+        }
+        reset_interval_to_next_sample(alloc_size);
         if (sampling_interval_ == 0)
         {
-            return 0;
+            return false;
         }
-        return static_cast<size_t>(sampling_interval_ * NumberOfSamples(alloc_sz));
+        else {
+            return true;
+        }
     }
 
     uint64_t sampling_interval() const { return sampling_interval_; }
 
+    size_t sample_size(size_t allocation_size) const {
+        return std::max(allocation_size, sampling_interval_);
+    }
+
 private:
-    int64_t NextSampleInterval() {
+    /// Resets interval_to_next_sample_ by repeatedly drawing from the exponential distribution
+    void reset_interval_to_next_sample(size_t alloc_size)
+    {
+        if (sampling_interval_ == 0) // sampling is off
+        {
+            interval_to_next_sample_ = std::numeric_limits<int64_t>::max();
+        }
+        else {
+            // Large allocations we will just consider in whole. This avoids
+            // having to sample the distribution too many times if a large alloc
+            // took us very negative we just add the alloc size back on
+            if (alloc_size > sampling_interval_)
+            {
+                interval_to_next_sample_ += alloc_size;
+            }
+            else {
+                while (interval_to_next_sample_ <= 0) {
+                    interval_to_next_sample_ += next_sampling_interval();
+                }
+            }
+        }
+    }
+
+    int64_t next_sampling_interval() {
         std::exponential_distribution<double> dist(sampling_rate_);
         int64_t next = static_cast<int64_t>(dist(random_gen));
         // We approximate the geometric distribution using an exponential
@@ -285,23 +326,11 @@ private:
         return next + 1;
     }
 
-    // Returns number of times a sample should be accounted. Due to how the
-    // poission sampling works, some samples should be accounted multiple times.
-    size_t NumberOfSamples(size_t alloc_sz) {
-        interval_to_next_sample_ -= alloc_sz;
-        size_t num_samples = 0;
-        while (interval_to_next_sample_ <= 0) {
-            interval_to_next_sample_ += NextSampleInterval();
-            ++num_samples;
-        }
-        return num_samples;
-    }
-
     std::random_device rd_device;
     std::mt19937_64 random_gen;
-    uint64_t sampling_interval_;
-    double sampling_rate_;
-    int64_t interval_to_next_sample_;
+    uint64_t sampling_interval_; // Sample every N bytes ; 0 means off
+    double sampling_rate_; // 1 / sampling_interval_ ; used by the exp distribution
+    int64_t interval_to_next_sample_; // Next time we are going to take a sample
 };
 
 // original memory allocator support
@@ -571,7 +600,7 @@ struct cpu_pages {
     } asu;
     allocation_site_ptr alloc_site_list_head = nullptr; // For easy traversal of asu.alloc_sites from scylla-gdb.py
     // bool collect_backtrace = false;
-    Sampler sampler;
+    sampler sampler;
 
     char* mem() { return memory; }
 
@@ -582,9 +611,9 @@ struct cpu_pages {
         unsigned nr_pages;
     };
     void maybe_reclaim();
-    void* allocate_large_and_trim(unsigned nr_pages, size_t sample_weight);
-    void* allocate_large(unsigned nr_pages, size_t sample_weight);
-    void* allocate_large_aligned(unsigned align_pages, unsigned nr_pages, size_t sample_weight);
+    void* allocate_large_and_trim(unsigned nr_pages, bool should_sample);
+    void* allocate_large(unsigned nr_pages, bool should_sample);
+    void* allocate_large_aligned(unsigned align_pages, unsigned nr_pages, bool should_sample);
     page* find_and_unlink_span(unsigned nr_pages);
     page* find_and_unlink_span_reclaiming(unsigned n_pages);
     void free_large(void* ptr);
@@ -616,7 +645,7 @@ struct cpu_pages {
     void warn_large_allocation(size_t size);
     allocation_site_ptr add_alloc_site(size_t allocated_size);
     void remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_size);
-    size_t should_sample(size_t size);
+    bool should_sample(size_t size);
     memory::memory_layout memory_layout();
     ~cpu_pages();
 };
@@ -640,7 +669,7 @@ void set_heap_profiling_enabled(size_t sample_every) {
             seastar_logger.info("Disabling heap profiler");
         }
     }
-    get_cpu_mem().sampler.SetSamplingInterval(sample_every);
+    get_cpu_mem().sampler.set_sampling_interval(sample_every);
 }
 
 size_t get_heap_profiling_enabled() {
@@ -796,7 +825,7 @@ void cpu_pages::maybe_reclaim() {
 }
 
 void*
-cpu_pages::allocate_large_and_trim(unsigned n_pages, size_t sample_weight) {
+cpu_pages::allocate_large_and_trim(unsigned n_pages, bool should_sample) {
     // Avoid exercising the reclaimers for requests we'll not be able to satisfy
     // nr_pages might be zero during startup, so check for that too
     if (nr_pages && n_pages >= nr_pages) {
@@ -819,7 +848,7 @@ cpu_pages::allocate_large_and_trim(unsigned n_pages, size_t sample_weight) {
     span->span_size = span_end->span_size = span_size;
     span->pool = nullptr;
 #ifdef SEASTAR_HEAPPROF
-    if (sample_weight)
+    if (should_sample)
     {
         auto alloc_site = add_alloc_site(span->span_size * page_size);
         span->alloc_site = alloc_site;
@@ -844,7 +873,7 @@ cpu_pages::add_alloc_site(size_t allocated_size) {
     allocation_site_ptr alloc_site = get_allocation_site();
     if (alloc_site) {
         ++alloc_site->count;
-        alloc_site->size += std::max(sampler.sampling_interval(), allocated_size);
+        alloc_site->size += sampler.sample_size(allocated_size);
     }
 
     return alloc_site;
@@ -854,7 +883,7 @@ void
 cpu_pages::remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_size) {
     if (alloc_site) {
         --alloc_site->count;
-        alloc_site->size -= std::max(sampler.sampling_interval(), deallocated_size);
+        alloc_site->size -= sampler.sample_size(deallocated_size);
         if (alloc_site->count == 0)
         {
             // lame: do better or fix the gdb script
@@ -878,9 +907,9 @@ cpu_pages::remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_
     }
 }
 
-size_t
+bool
 cpu_pages::should_sample(size_t size) {
-    return sampler.SampleSize(size);
+    return sampler.should_sample(size);
 }
 
 void
@@ -892,25 +921,25 @@ cpu_pages::check_large_allocation(size_t size) {
 }
 
 void*
-cpu_pages::allocate_large(unsigned n_pages, size_t sample_weight) {
+cpu_pages::allocate_large(unsigned n_pages, bool should_sample) {
     check_large_allocation(n_pages * page_size);
-    return allocate_large_and_trim(n_pages, sample_weight);
+    return allocate_large_and_trim(n_pages, should_sample);
 }
 
 void*
-cpu_pages::allocate_large_aligned(unsigned align_pages, unsigned n_pages, size_t sample_weight) {
+cpu_pages::allocate_large_aligned(unsigned align_pages, unsigned n_pages, bool should_sample) {
     check_large_allocation(n_pages * page_size);
     // buddy allocation is always aligned
-    return allocate_large_and_trim(n_pages, sample_weight);
+    return allocate_large_and_trim(n_pages, should_sample);
 }
 
 disable_backtrace_temporarily::disable_backtrace_temporarily() {
     _old = get_cpu_mem().sampler.sampling_interval();
-    get_cpu_mem().sampler.SetSamplingInterval(0);
+    get_cpu_mem().sampler.set_sampling_interval(0);
 }
 
 disable_backtrace_temporarily::~disable_backtrace_temporarily() {
-    get_cpu_mem().sampler.SetSamplingInterval(_old);
+    get_cpu_mem().sampler.set_sampling_interval(_old);
 }
 
 static
@@ -1531,11 +1560,11 @@ void* allocate(size_t size) {
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
     }
-    size_t sample_weight = get_cpu_mem().should_sample(size);
+    size_t should_sample = get_cpu_mem().should_sample(size);
     void* ptr;
     if (size <= max_small_allocation) {
 #ifdef SEASTAR_HEAPPROF
-        if (sample_weight)
+        if (should_sample)
         {
             ptr = allocate_from_sampled_small_pool<alignment_t::unaligned>(size);
         }
@@ -1545,7 +1574,7 @@ void* allocate(size_t size) {
             ptr = allocate_from_small_pool<alignment_t::unaligned>(size);
         }
     } else {
-        ptr = allocate_large(size, sample_weight);
+        ptr = allocate_large(size, should_sample);
     }
     if (!ptr) {
         on_allocation_failure(size);
