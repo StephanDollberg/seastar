@@ -599,7 +599,6 @@ struct cpu_pages {
         alloc_sites_type alloc_sites;
     } asu;
     allocation_site_ptr alloc_site_list_head = nullptr; // For easy traversal of asu.alloc_sites from scylla-gdb.py
-    // bool collect_backtrace = false;
     sampler sampler;
 
     char* mem() { return memory; }
@@ -658,51 +657,51 @@ static cpu_pages& get_cpu_mem();
 
 #ifdef SEASTAR_HEAPPROF
 
-void set_heap_profiling_enabled(size_t sample_every) {
-    bool current_sample_every = get_cpu_mem().sampler.sampling_interval();
-    if (sample_every) {
-        if (!current_sample_every) {
-            seastar_logger.info("Enabling heap profiler");
+void set_heap_profiling_sampling_rate(size_t sample_rate) {
+    bool current_sample_rate = get_cpu_mem().sampler.sampling_interval();
+    if (sample_rate) {
+        if (!current_sample_rate) {
+            seastar_logger.info("Enabling heap profiler - using {} bytes sampling rate", sample_rate);
         }
     } else {
-        if (current_sample_every) {
+        if (current_sample_rate) {
             seastar_logger.info("Disabling heap profiler");
         }
     }
-    get_cpu_mem().sampler.set_sampling_interval(sample_every);
+    get_cpu_mem().sampler.set_sampling_interval(sample_rate);
 }
 
-size_t get_heap_profiling_enabled() {
-    return get_cpu_mem().sampler.sampling_interval();
+bool get_heap_profiling_enabled() {
+    return get_cpu_mem().sampler.sampling_interval() > 0;
 }
 
 static thread_local int64_t scoped_heap_profiling_embed_count = 0;
 
-scoped_heap_profiling::scoped_heap_profiling() noexcept {
+scoped_heap_profiling::scoped_heap_profiling(size_t sample_rate) noexcept {
     ++scoped_heap_profiling_embed_count;
-    set_heap_profiling_enabled(1);
+    set_heap_profiling_sampling_rate(sample_rate);
 }
 
 scoped_heap_profiling::~scoped_heap_profiling() {
     if (!--scoped_heap_profiling_embed_count) {
-        set_heap_profiling_enabled(0);
+        set_heap_profiling_sampling_rate(0);
     }
 }
 
 #else
 
-void set_heap_profiling_enabled(size_t enable) {
+void set_heap_profiling_sampling_rate(size_t enable) {
     seastar_logger.warn("Seastar compiled without heap profiling support, heap profiler not supported;"
             " compile with the Seastar_HEAP_PROFILING=ON CMake option to add heap profiling support");
 }
 
-size_t get_heap_profiling_enabled() {
+bool get_heap_profiling_enabled() {
     // don't log here, called on all paths
-    return 0;
+    return false;
 }
 
-scoped_heap_profiling::scoped_heap_profiling() noexcept {
-    set_heap_profiling_enabled(true); // let it print the warning
+scoped_heap_profiling::scoped_heap_profiling(size_t sample_rate) noexcept {
+    set_heap_profiling_sampling_rate(sample_rate); // let it print the warning
 }
 
 scoped_heap_profiling::~scoped_heap_profiling() {

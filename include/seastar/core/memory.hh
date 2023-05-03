@@ -405,31 +405,31 @@ struct allocation_site {
 /// If memory sampling is on returns the current sampled memory live set
 std::vector<allocation_site> sampled_memory_profile();
 
-// TODO: update for sampling
-/// Enable/disable heap profiling.
+/// Enable sampled heap profiling by setting a sample rate
+/// disable heap profiling by setting the sample rate to 0
 ///
 /// In order to use heap profiling you have to define
 /// `SEASTAR_HEAPPROF`.
-/// Heap profiling data is not currently exposed via an API for
-/// inspection, instead it was designed to be inspected from a
-/// debugger.
+///
+/// Use \ref sampled_memory_profile for API access to profiling data
+///
 /// For an example script that makes use of the heap profiling data
 /// see [scylla-gdb.py] (https://github.com/scylladb/scylla/blob/e1b22b6a4c56b4f1d0adf65d1a11db4bcb51fe7d/scylla-gdb.py#L1439)
 /// This script can generate either textual representation of the data,
 /// or a zoomable flame graph ([flame graph generation instructions](https://github.com/scylladb/scylla/wiki/Seastar-heap-profiler),
 /// [example flame graph](https://user-images.githubusercontent.com/1389273/72920437-f0cf8a80-3d51-11ea-92f0-f3dbeb698871.png)).
-void set_heap_profiling_enabled(size_t);
+void set_heap_profiling_sampling_rate(size_t);
 
 /// Checks whether heap profiling is currently enabled
-size_t get_heap_profiling_enabled();
+bool get_heap_profiling_enabled();
 
 /// Enable heap profiling for the duration of the scope.
 ///
 /// For more information about heap profiling see
-/// \ref set_heap_profiling_enabled().
+/// \ref set_heap_profiling_sampling_rate().
 class scoped_heap_profiling {
 public:
-    scoped_heap_profiling() noexcept;
+    scoped_heap_profiling(size_t) noexcept;
     ~scoped_heap_profiling();
 };
 
