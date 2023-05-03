@@ -1120,13 +1120,10 @@ void cpu_pages::shrink(void* ptr, size_t new_size) {
         return;
     }
 #ifdef SEASTAR_HEAPPROF
-    if (span->alloc_site)
-    {
-        auto alloc_site = span->alloc_site;
-        if (alloc_site) {
-            alloc_site->size -= span->span_size * page_size;
-            alloc_site->size += new_size_pages * page_size;
-        }
+    auto alloc_site = span->alloc_site;
+    if (alloc_site) {
+        alloc_site->size -= span->span_size * page_size;
+        alloc_site->size += new_size_pages * page_size;
     }
 #endif
     span->span_size = new_size_pages;
