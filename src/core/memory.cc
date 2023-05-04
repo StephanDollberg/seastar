@@ -494,6 +494,10 @@ class small_pool {
     unsigned _min_free;
     unsigned _max_free;
     unsigned _pages_in_use = 0;
+    // Flag to indicate whether this pool stores sampled allocations.
+    // When freeing small allocations this flag is checked to see whether an
+    // allocation site pointer is part of the object and the allocation needs
+    // removal from the allocation_site tracking
     bool _sampled_pool = false;
     page_list _span_list;
     static constexpr unsigned idx_frac_bits = 2;
@@ -503,6 +507,7 @@ public:
     void* allocate();
     void deallocate(void* object);
     unsigned object_size() const { return _object_size; }
+    /// See _sampled_pool
     bool is_sampled_pool() const { return _sampled_pool; }
     bool objects_page_aligned() const { return is_page_aligned(_object_size); }
     static constexpr unsigned size_to_idx(unsigned size);
@@ -539,7 +544,7 @@ small_pool::size_to_idx(unsigned size) {
             + ((size - 1) >> (log2floor(size) - idx_frac_bits));
 }
 
-template<bool sampled>
+template<bool sampled> // tag the pools in this array as sampled, see small_pool._sampled_pool
 class small_pool_array {
 public:
     static constexpr unsigned nr_small_pools = small_pool::size_to_idx(4 * page_size) + 1;
