@@ -410,6 +410,11 @@ struct allocation_site {
 /// If memory sampling is on returns the current sampled memory live set
 std::vector<allocation_site> sampled_memory_profile();
 
+/// Copies the current sampled set of allocation_sites in the output parameter
+/// (up to size of output vector) Returns amount of copied elements. Useful if
+/// one wants to avoid allocating an output vector (e.g.: under OOM conditions)
+size_t sampled_memory_profile(std::vector<allocation_site>&);
+
 /// Enable sampled heap profiling by setting a sample rate
 /// disable heap profiling by setting the sample rate to 0
 ///

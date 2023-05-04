@@ -2063,6 +2063,12 @@ std::vector<allocation_site> sampled_memory_profile() {
     return ret;
 }
 
+size_t sampled_memory_profile(std::vector<allocation_site>& output) {
+    auto to_copy = std::min(output.size(), get_cpu_mem().asu.alloc_sites.size());
+    std::copy_n(get_cpu_mem().asu.alloc_sites.begin(), to_copy, output.begin());
+    return to_copy;
+}
+
 }
 
 }
