@@ -885,20 +885,17 @@ cpu_pages::remove_alloc_site(allocation_site_ptr alloc_site, size_t deallocated_
         alloc_site->size -= sampler.sample_size(deallocated_size);
         if (alloc_site->count == 0)
         {
-            // lame: do better or fix the gdb script
-            if (cpu_mem.alloc_site_list_head == alloc_site)
+            if (alloc_site->prev)
             {
-                cpu_mem.alloc_site_list_head = alloc_site->next;
+                alloc_site->prev->next = alloc_site->next;
             }
-            else {
-                for (auto& ele : asu.alloc_sites)
-                {
-                    if (ele.next == alloc_site)
-                    {
-                        ele.next = alloc_site->next;
-                        break;
-                    }
-                }
+            if (alloc_site->next)
+            {
+                alloc_site->next->prev = alloc_site->prev;
+            }
+            if (alloc_site_list_head == alloc_site)
+            {
+                alloc_site_list_head = alloc_site->next;
             }
 
             asu.alloc_sites.erase(*alloc_site);
@@ -968,6 +965,10 @@ allocation_site_ptr get_allocation_site() {
     allocation_site_ptr alloc_site = &*insert_result.first;
     if (insert_result.second) {
         alloc_site->next = cpu_mem.alloc_site_list_head;
+        if (cpu_mem.alloc_site_list_head)
+        {
+            cpu_mem.alloc_site_list_head->prev = alloc_site;
+        }
         cpu_mem.alloc_site_list_head = alloc_site;
     }
     return alloc_site;
