@@ -75,6 +75,7 @@
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/memory_diagnostics.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/sampler.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/aligned_buffer.hh>
 #include <unordered_set>
