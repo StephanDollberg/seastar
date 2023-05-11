@@ -46,8 +46,7 @@ public:
     /// Sets the sampling interval in bytes. Setting it to 0 means to never sample
     void set_sampling_interval(uint64_t sampling_interval) {
         sampling_interval_ = sampling_interval;
-        if (sampling_interval_ == 0)
-        {
+        if (sampling_interval_ == 0) {
             // Set the interval very large. This means in practice we will
             // likely never get this below zero and hence it's unlikely we will
             // ever have to run the reset path with sampling off
@@ -66,40 +65,34 @@ public:
         // Hence, lets do the interval decrement and check first and only check
         // whether sampling is off after.
         interval_to_next_sample_ -= alloc_size;
-        if (interval_to_next_sample_ > 0)
-        {
+        if (interval_to_next_sample_ > 0) {
             return false;
         }
         reset_interval_to_next_sample(alloc_size);
-        if (sampling_interval_ == 0)
-        {
-            return false;
-        }
-        else {
-            return true;
-        }
+        return sampling_interval_ != 0;
     }
 
     uint64_t sampling_interval() const { return sampling_interval_; }
 
+    /// How much should an allocation of size `allocation_size` count for
     size_t sample_size(size_t allocation_size) const {
         return std::max(allocation_size, sampling_interval_);
     }
 
 private:
-    /// Resets interval_to_next_sample_ by repeatedly drawing from the exponential distribution
+    /// Resets interval_to_next_sample_ by repeatedly drawing from the
+    /// exponential distribution given an allocation of size `alloc_size`
+    /// breached the current interval
     void reset_interval_to_next_sample(size_t alloc_size)
     {
-        if (sampling_interval_ == 0) // sampling is off
-        {
+        if (sampling_interval_ == 0) { // sampling is off
             interval_to_next_sample_ = std::numeric_limits<int64_t>::max();
         }
         else {
             // Large allocations we will just consider in whole. This avoids
             // having to sample the distribution too many times if a large alloc
             // took us very negative we just add the alloc size back on
-            if (alloc_size > sampling_interval_)
-            {
+            if (alloc_size > sampling_interval_) {
                 interval_to_next_sample_ += alloc_size;
             }
             else {
