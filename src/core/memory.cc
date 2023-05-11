@@ -2383,12 +2383,24 @@ disable_backtrace_temporarily::disable_backtrace_temporarily() {
 disable_backtrace_temporarily::~disable_backtrace_temporarily() {
 }
 
-void set_heap_profiling_enabled(bool enabled) {
+void set_heap_profiling_sampling_rate(size_t) {
     seastar_logger.warn("Seastar compiled with default allocator, heap profiler not supported");
 }
 
-scoped_heap_profiling::scoped_heap_profiling() noexcept {
-    set_heap_profiling_enabled(true); // let it print the warning
+bool get_heap_profiling_enabled() {
+    return false;
+}
+
+std::vector<allocation_site> sampled_memory_profile() {
+    return {};
+}
+
+size_t sampled_memory_profile(std::vector<allocation_site>&) {
+    return 0;
+}
+
+scoped_heap_profiling::scoped_heap_profiling(size_t sample_rate) noexcept {
+    set_heap_profiling_sampling_rate(sample_rate); // let it print the warning
 }
 
 scoped_heap_profiling::~scoped_heap_profiling() {
