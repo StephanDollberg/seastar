@@ -586,6 +586,9 @@ void set_heap_profiling_sampling_rate(size_t sample_rate) {
     if (sample_rate) {
         if (!current_sample_rate) {
             seastar_logger.info("Enabling heap profiler - using {} bytes sampling rate", sample_rate);
+        } else {
+            seastar_logger.warn("Ignoring change to heap profiler sample rate as heap profiling is already turned on");
+            return;
         }
     } else {
         if (current_sample_rate) {

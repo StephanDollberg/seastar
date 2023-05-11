@@ -386,7 +386,9 @@ public:
 /// Describes an allocation location in the code.  The location is identified by
 /// its backtrace. One allocation_site can represent many allocations at the
 /// same location. `count` and `size` represent the cumulative sum of all
-/// allocations at the location.
+/// allocations at the location. Note the size represents an extrapolated size and
+/// not the sampled one, i.e.: when looking at the total size of all allocation
+/// sites it will approximate the total memory usage
 struct allocation_site {
     mutable size_t count = 0; // number of live objects allocated at backtrace.
     mutable size_t size = 0; // amount of bytes in live objects allocated at backtrace.
@@ -408,6 +410,9 @@ struct allocation_site {
 };
 
 /// If memory sampling is on returns the current sampled memory live set
+///
+/// If there is tracked allocations (because heap profiling was on earlier)
+/// these will still be returned if heap profiling is now off
 std::vector<allocation_site> sampled_memory_profile();
 
 /// Copies the current sampled set of allocation_sites in the output parameter
@@ -423,6 +428,11 @@ size_t sampled_memory_profile(std::vector<allocation_site>&);
 ///
 /// Use \ref sampled_memory_profile for API access to profiling data
 ///
+/// Note: Changing the sampling rate is currently not supported.
+/// Re-enabling heap profiling with a different sample rate to previous is fine
+/// to do if and only if all allocations are freeed before heap profiling is
+/// turned back on.
+///
 /// For an example script that makes use of the heap profiling data
 /// see [scylla-gdb.py] (https://github.com/scylladb/scylla/blob/e1b22b6a4c56b4f1d0adf65d1a11db4bcb51fe7d/scylla-gdb.py#L1439)
 /// This script can generate either textual representation of the data,
@@ -434,6 +444,8 @@ void set_heap_profiling_sampling_rate(size_t);
 bool get_heap_profiling_enabled();
 
 /// Enable heap profiling for the duration of the scope.
+///
+/// Note: Nesting different sample rates is currently not supported.
 ///
 /// For more information about heap profiling see
 /// \ref set_heap_profiling_sampling_rate().
