@@ -1314,11 +1314,8 @@ public:
 
     typedef net::fragment* frag_iter;
 
-    future<> do_put(frag_iter i, frag_iter e) {
+    future<> do_put(char* ptr, size_t size) {
         assert(_output_pending.available());
-        return do_for_each(i, e, [this](net::fragment& f) {
-            auto ptr = f.base;
-            auto size = f.size;
             size_t off = 0; // here to appease eclipse cdt
             return repeat([this, ptr, size, off]() mutable {
                 if (off == size) {
@@ -1334,7 +1331,6 @@ public:
                     return make_ready_future<stop_iteration>(stop_iteration::no);
                 });
             });
-        });
     }
     future<> put(net::packet p) {
         if (_error) {
@@ -1348,9 +1344,8 @@ public:
                return put(std::move(p));
             });
         }
-        auto i = p.fragments().begin();
-        auto e = p.fragments().end();
-        return with_semaphore(_out_sem, 1, std::bind(&session::do_put, this, i, e)).finally([p = std::move(p)] {});
+        p.linearize();
+        return with_semaphore(_out_sem, 1, std::bind(&session::do_put, this, p.frag(0).base, p.frag(0).size)).finally([p = std::move(p)] {});
     }
 
     ssize_t pull(void* dst, size_t len) {
