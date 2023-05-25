@@ -965,6 +965,18 @@ future<shared_ptr<tls::server_credentials>> tls::credentials_builder::build_relo
 
 namespace tls {
 
+seastar::logger seastar_tls_logger("tls");
+
+    static thread_local size_t total_fragscount = 0;
+    static thread_local size_t last_fragscount = 0;
+    static thread_local size_t total_do_puts = 0;
+    static thread_local size_t last_do_puts = 0;
+
+    static thread_local size_t total_gnu_size = 0;
+    static thread_local size_t last_gnu_size = 0;
+    static thread_local size_t total_gnu_send = 0;
+    static thread_local size_t last_gnu_send = 0;
+
 /**
  * Session wraps gnutls session, and is the
  * actual conduit for an TLS/SSL data flow.
@@ -1316,7 +1328,14 @@ public:
 
     future<> do_put(frag_iter i, frag_iter e) {
         assert(_output_pending.available());
+
+        total_do_puts++;
+        last_do_puts++;
+
         return do_for_each(i, e, [this](net::fragment& f) {
+            total_fragscount++;
+            last_fragscount++;
+
             auto ptr = f.base;
             auto size = f.size;
             size_t off = 0; // here to appease eclipse cdt
@@ -1328,9 +1347,28 @@ public:
                 if (res > 0) { // don't really need to check, but...
                     off += res;
                 }
+
+                total_gnu_send++;
+                last_gnu_send++;
+                total_gnu_size += res;
+                last_gnu_size += res;
+
                 // what will we wait for? error or results...
                 auto f = res < 0 ? handle_output_error(res) : wait_for_output();
                 return f.then([] {
+                    if (total_do_puts % 100000 == 0 && last_do_puts != 0)
+                    {
+                        seastar_tls_logger.info("total_do_puts: {} total fragscount: {} avg frags/put: {}", total_do_puts, total_fragscount, double(total_fragscount) / total_do_puts);
+                        seastar_tls_logger.info("last_do_puts: {} last fragscount: {} avg frags/put: {}", last_do_puts, last_fragscount, double(last_do_puts) / last_fragscount);
+                        seastar_tls_logger.info("total_gnu_send: {} total gnu size: {} avg size/send: {}", total_gnu_send, total_gnu_size, double(total_gnu_size) / total_gnu_send);
+                        seastar_tls_logger.info("last_gnu_send: {} last gnu size: {} avg size/send: {}", last_gnu_send, last_gnu_size, double(last_gnu_size) / last_gnu_send);
+
+                        last_do_puts = 0;
+                        last_fragscount = 0;
+                        last_gnu_send = 0;
+                        last_gnu_size = 0;
+                    }
+
                     return make_ready_future<stop_iteration>(stop_iteration::no);
                 });
             });
