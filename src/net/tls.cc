@@ -19,6 +19,8 @@
  * Copyright 2015 Cloudius Systems
  */
 
+#include "seastar/core/scattered_message.hh"
+#include "seastar/util/defer.hh"
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 #include <stdexcept>
@@ -1314,27 +1316,36 @@ public:
 
     typedef net::fragment* frag_iter;
 
+    scattered_message<char>* _msg = nullptr;
+
     future<> do_put(frag_iter i, frag_iter e) {
         assert(_output_pending.available());
-        return do_for_each(i, e, [this](net::fragment& f) {
+
+        scattered_message<char> msg;
+
+        _msg = &msg;
+        auto reset_msg = defer([this] () noexcept { _msg = nullptr; });
+
+        for (auto it = i ; it != e; ++it) {
+            auto& f = *it;
             auto ptr = f.base;
             auto size = f.size;
-            size_t off = 0; // here to appease eclipse cdt
-            return repeat([this, ptr, size, off]() mutable {
-                if (off == size) {
-                    return make_ready_future<stop_iteration>(stop_iteration::yes);
-                }
+            size_t off = 0;
+
+            while (off < size) {
                 auto res = gnutls_record_send(*this, ptr + off, size - off);
-                if (res > 0) { // don't really need to check, but...
-                    off += res;
+
+                if (res <= 0) {
+                    return handle_output_error(res);
                 }
-                // what will we wait for? error or results...
-                auto f = res < 0 ? handle_output_error(res) : wait_for_output();
-                return f.then([] {
-                    return make_ready_future<stop_iteration>(stop_iteration::no);
-                });
-            });
-        });
+
+                off += res;
+            }
+        }
+
+        _output_pending = _out.put(std::move(msg).release());
+
+        return wait_for_output();
     }
     future<> put(net::packet p) {
         if (_error) {
@@ -1368,21 +1379,28 @@ public:
         _input.trim_front(n);
         return n;
     }
+
     ssize_t vec_push(const giovec_t * iov, int iovcnt) {
         if (!_output_pending.available()) {
             gnutls_transport_set_errno(*this, EAGAIN);
             return -1;
         }
         try {
-            ssize_t n; // Set on the good path and unused on the bad path
+            ssize_t n = 0; // Set on the good path and unused on the bad path
 
             if (!_output_pending.failed()) {
                 scattered_message<char> msg;
+                auto msg_ptr = _msg != nullptr ? _msg : &msg;
+
                 for (int i = 0; i < iovcnt; ++i) {
-                    msg.append(std::string_view(reinterpret_cast<const char *>(iov[i].iov_base), iov[i].iov_len));
+                    msg_ptr->append(std::string_view(reinterpret_cast<const char *>(iov[i].iov_base), iov[i].iov_len));
+                    n += iov[i].iov_len;
                 }
-                n = msg.size();
-                _output_pending = _out.put(std::move(msg).release());
+
+                if (_msg == nullptr)
+                {
+                    _output_pending = _out.put(std::move(msg).release());
+                }
             }
             if (_output_pending.failed()) {
                 // exception is copied back into _output_pending
