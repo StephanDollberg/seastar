@@ -1124,6 +1124,10 @@ public:
             if (_type == type::CLIENT || _creds->get_client_auth() != client_auth::NONE) {
                 verify();
             }
+            auto cipher = gnutls_cipher_get(*this);
+            if (cipher) {
+                seastar_logger.info("cipher: {} on {}", gnutls_cipher_get_name(cipher), _sock->local_address());
+            }
             _connected = true;
             // make sure we reset output_pending
             return wait_for_output();
