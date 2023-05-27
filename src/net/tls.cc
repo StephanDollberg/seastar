@@ -967,6 +967,12 @@ future<shared_ptr<tls::server_credentials>> tls::credentials_builder::build_relo
 
 namespace tls {
 
+static connected_socket_input_stream_config tls_input_stream_config{
+    .buffer_size = 16500,
+    .min_buffer_size = 16500,
+    .max_buffer_size = 128000,
+};
+
 static thread_local size_t total_recv_count = 0;
 static thread_local size_t total_recv_size = 0;
 /**
@@ -990,7 +996,7 @@ size_t last_recv_size = 0;
     session(type t, shared_ptr<tls::certificate_credentials> creds,
             std::unique_ptr<net::connected_socket_impl> sock, sstring name = { })
             : _type(t), _sock(std::move(sock)), _creds(creds->_impl), _hostname(
-                    std::move(name)), _in(_sock->source()), _out(_sock->sink()),
+                    std::move(name)), _in(_sock->source(tls_input_stream_config)), _out(_sock->sink()),
                     _in_sem(1), _out_sem(1), _output_pending(
                     make_ready_future<>()), _session([t] {
                 gnutls_session_t session;
