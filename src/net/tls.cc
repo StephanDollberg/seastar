@@ -967,6 +967,8 @@ future<shared_ptr<tls::server_credentials>> tls::credentials_builder::build_relo
 
 namespace tls {
 
+static thread_local size_t total_recv_count = 0;
+static thread_local size_t total_recv_size = 0;
 /**
  * Session wraps gnutls session, and is the
  * actual conduit for an TLS/SSL data flow.
@@ -978,6 +980,8 @@ namespace tls {
  */
 class session : public enable_lw_shared_from_this<session> {
 public:
+size_t last_recv_count = 0;
+size_t last_recv_size = 0;
     enum class type
         : uint32_t {
             CLIENT = GNUTLS_CLIENT, SERVER = GNUTLS_SERVER,
@@ -1036,6 +1040,12 @@ public:
     }
 
     ~session() {
+        seastar_logger.info(
+            "{}: last recvs: {} last size: {} avg size/recv: {}",
+            _sock->local_address(),
+            last_recv_count, last_recv_size,
+            double(last_recv_size) / last_recv_count);
+
         assert(_output_pending.available());
     }
 
@@ -1372,15 +1382,30 @@ public:
         if (eof()) {
             return 0;
         }
+
         // If we have data in buffers, we can complete.
         // Otherwise, we must be conservative.
         if (_input.empty()) {
             gnutls_transport_set_errno(*this, EAGAIN);
             return -1;
         }
+
         auto n = std::min(len, _input.size());
         memcpy(dst, _input.get(), n);
         _input.trim_front(n);
+
+        ++total_recv_count;
+        ++last_recv_count;
+        total_recv_size += n;
+        last_recv_size += n;
+
+        if (total_recv_count % 100000 == 0) {
+            seastar_logger.info(
+                "total recvs: {} total size: {} avg size/recv: {}",
+                total_recv_count, total_recv_size,
+                double(total_recv_size) / total_recv_count);
+        }
+
         return n;
     }
 
