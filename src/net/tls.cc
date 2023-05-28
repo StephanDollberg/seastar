@@ -1359,6 +1359,15 @@ public:
                return put(std::move(p));
             });
         }
+
+        // We want to make sure that we call gnutls_record_send with as large
+        // packets as possible. This is because it results in larger TLS records
+        // which makes encryption/decryption faster and also results in larger
+        // batches on the receive side. Max TLS record size is 16384.
+        if (p.nr_frags() > 1 && p.len() < 16384) {
+            p.linearize();
+        }
+
         auto i = p.fragments().begin();
         auto e = p.fragments().end();
         return with_semaphore(_out_sem, 1, std::bind(&session::do_put, this, i, e)).finally([p = std::move(p)] {});
