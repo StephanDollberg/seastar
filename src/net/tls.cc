@@ -20,7 +20,9 @@
  */
 
 #include "seastar/core/scattered_message.hh"
+#include "seastar/net/packet.hh"
 #include "seastar/util/defer.hh"
+#include <chrono>
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 #include <stdexcept>
@@ -1338,15 +1340,64 @@ size_t last_recv_size = 0;
 
     scattered_message<char>* _msg = nullptr;
 
-    future<> do_put(frag_iter i, frag_iter e) {
+    net::packet _pending_packet;
+
+    timer<> _timer;
+
+    future<> do_put(net::packet p, bool force) {
         assert(_output_pending.available());
 
-        scattered_message<char> msg;
+        auto pending_len = _pending_packet ? _pending_packet.len() : 0;
+        if (!force && p.len() + pending_len < 16000) {
+            if (_pending_packet)
+            {
+                _pending_packet.append(std::move(p));
+            }
+            else {
+                _pending_packet = std::move(p);
+            }
 
+            if (!_timer.armed())
+            {
+                _timer.cancel();
+                _timer.arm(std::chrono::milliseconds(5));
+                _timer.set_callback([this, self = shared_from_this()] () {
+                    _timer.set_callback([] () {});
+
+                    // if (_connected) {
+                        (void) with_semaphore(_out_sem, 1, [this] () {
+
+                            auto ret_fut = do_put(std::move(_pending_packet), true);
+                            _pending_packet.reset();
+                            return ret_fut;
+
+                        }).finally([self = std::move(self)] () {
+                        });
+                    // }
+                });
+            }
+            return make_ready_future<>();
+        }
+
+        if (_pending_packet)
+        {
+            // seastar_logger.info("pending exists");
+            _pending_packet.append(std::move(p));
+        }
+        else {
+            // seastar_logger.info("no pending");
+            _pending_packet = std::move(p);
+        }
+
+        _timer.cancel();
+
+        scattered_message<char> msg;
         _msg = &msg;
         auto reset_msg = defer([this] () noexcept { _msg = nullptr; });
+        auto reset_pkt = defer([this] () noexcept { _pending_packet.reset(); });
 
-        for (auto it = i ; it != e; ++it) {
+        for (auto it = _pending_packet.fragments().begin(); it != _pending_packet.fragments().end(); ++it) {
+        // for (auto it = p.fragments().begin(); it != p.fragments().end(); ++it) {
             auto& f = *it;
             auto ptr = f.base;
             auto size = f.size;
@@ -1362,6 +1413,8 @@ size_t last_recv_size = 0;
                 off += res;
             }
         }
+
+        // seastar_logger.info("send now");
 
         _output_pending = _out.put(std::move(msg).release());
 
@@ -1379,9 +1432,11 @@ size_t last_recv_size = 0;
                return put(std::move(p));
             });
         }
-        auto i = p.fragments().begin();
-        auto e = p.fragments().end();
-        return with_semaphore(_out_sem, 1, std::bind(&session::do_put, this, i, e)).finally([p = std::move(p)] {});
+        // auto i = p.fragments().begin();
+        // auto e = p.fragments().end();
+        return with_semaphore(_out_sem, 1, [this, p = std::move(p)] () mutable {
+            return do_put(std::move(p), false);
+        }); //.finally([p = std::move(p)] {});
     }
 
     ssize_t pull(void* dst, size_t len) {
@@ -1410,6 +1465,17 @@ size_t last_recv_size = 0;
                 "total recvs: {} total size: {} avg size/recv: {}",
                 total_recv_count, total_recv_size,
                 double(total_recv_size) / total_recv_count);
+        }
+
+        if (last_recv_count % 50000 == 0) {
+            seastar_logger.info(
+                "{}: last recvs: {} last size: {} avg size/recv: {}",
+                _sock->local_address(),
+                last_recv_count, last_recv_size,
+                double(last_recv_size) / last_recv_count);
+
+            last_recv_count = 0;
+            last_recv_size = 0;
         }
 
         return n;
