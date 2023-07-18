@@ -33,7 +33,7 @@ struct maybe_yield_awaiter final : task {
     using coroutine_handle_t = std::coroutine_handle<void>;
 
     coroutine_handle_t when_ready;
-    task* main_coroutine_task;
+    task* main_coroutine_task = nullptr;
 
     bool await_ready() const {
         return !need_preempt();
