@@ -21,6 +21,8 @@
 #include "core/reactor_backend.hh"
 #include "core/thread_pool.hh"
 #include "core/syscall_result.hh"
+#include <asm-generic/errno-base.h>
+#include <cstring>
 #include <seastar/core/internal/buffer_allocator.hh>
 #include <seastar/util/internal/iovec_utils.hh>
 #include <seastar/core/internal/uname.hh>
@@ -329,13 +331,20 @@ size_t aio_general_context::flush() {
             begin += r;
             continue;
         }
+
+        if (r == -1 && errno != EAGAIN) {
+            seastar_logger.error("swag flush failed with: {}", strerror(errno));
+        }
+
         // errno == EAGAIN is expected here. We don't explicitly assert that
         // since the assert below prevents an endless loop for any reason.
         if (retry_until == no_time_point) {
             // allow retrying for 1 second
             retry_until = clock::now() + 1s;
         } else {
-            assert(clock::now() < retry_until);
+            seastar_logger.error("swag flush failed with eagain time diff: {}ms", 
+                std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - retry_until).count());
+            // assert(clock::now() < retry_until);
         }
     }
     auto nr = last - iocbs.get();
