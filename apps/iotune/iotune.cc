@@ -837,8 +837,7 @@ int main(int ac, char** av) {
                     }
                 });
 
-                row_stats rates;
-                auto accuracy_msg = [accuracy, &rates] {
+                auto accuracy_msg = [accuracy] (const row_stats& rates) {
                     auto stdev = rates.stdev_percents() * 100.0;
                     return (accuracy == 0 || stdev > accuracy) ? fmt::format(" (deviation {}%)", int(round(stdev))) : std::string("");
                 };
@@ -854,44 +853,44 @@ int main(int ac, char** av) {
                     write_bw += iotune_tests.write_sequential_data(shard, sequential_buffer_size, duration * 0.70 / smp::count).get();
                 }
                 write_bw.bytes_per_sec /= smp::count;
-                rates = iotune_tests.get_serial_rates().get();
-                fmt::print("{} MiB/s{}\n", uint64_t(write_bw.bytes_per_sec / (1024 * 1024)), accuracy_msg());
+                auto write_rates = iotune_tests.get_serial_rates().get();
+                fmt::print("{} MiB/s{}\n", uint64_t(write_bw.bytes_per_sec / (1024 * 1024)), accuracy_msg(write_rates));
 
                 std::optional<uint64_t> write_sat;
 
                 if (write_saturation) {
                     fmt::print("Measuring write saturation length: ");
                     std::cout.flush();
-                    write_sat = iotune_tests.saturate_write(write_bw.bytes_per_sec * (1.0 - rates.stdev_percents()), sequential_buffer_size/2, duration * 0.70).get();
+                    write_sat = iotune_tests.saturate_write(write_bw.bytes_per_sec * (1.0 - write_rates.stdev_percents()), sequential_buffer_size/2, duration * 0.70).get();
                     fmt::print("{}\n", *write_sat);
                 }
 
                 fmt::print("Measuring sequential read bandwidth: ");
                 std::cout.flush();
                 auto read_bw = iotune_tests.read_sequential_data(0, sequential_buffer_size, duration * 0.1).get();
-                rates = iotune_tests.get_serial_rates().get();
-                fmt::print("{} MiB/s{}\n", uint64_t(read_bw.bytes_per_sec / (1024 * 1024)), accuracy_msg());
+                auto read_rates = iotune_tests.get_serial_rates().get();
+                fmt::print("{} MiB/s{}\n", uint64_t(read_bw.bytes_per_sec / (1024 * 1024)), accuracy_msg(read_rates));
 
                 std::optional<uint64_t> read_sat;
 
                 if (read_saturation) {
                     fmt::print("Measuring read saturation length: ");
                     std::cout.flush();
-                    read_sat = iotune_tests.saturate_read(read_bw.bytes_per_sec * (1.0 - rates.stdev_percents()), sequential_buffer_size/2, duration * 0.1).get();
+                    read_sat = iotune_tests.saturate_read(read_bw.bytes_per_sec * (1.0 - read_rates.stdev_percents()), sequential_buffer_size/2, duration * 0.1).get();
                     fmt::print("{}\n", *read_sat);
                 }
 
                 fmt::print("Measuring random write IOPS: ");
                 std::cout.flush();
                 auto write_iops = iotune_tests.write_random_data(test_directory.minimum_io_size(), duration * 0.1).get();
-                rates = iotune_tests.get_sharded_worst_rates().get();
-                fmt::print("{} IOPS{}\n", uint64_t(write_iops.iops), accuracy_msg());
+                auto write_iops_rates = iotune_tests.get_sharded_worst_rates().get();
+                fmt::print("{} IOPS{}\n", uint64_t(write_iops.iops), accuracy_msg(write_iops_rates));
 
                 fmt::print("Measuring random read IOPS: ");
                 std::cout.flush();
                 auto read_iops = iotune_tests.read_random_data(test_directory.minimum_io_size(), duration * 0.1).get();
-                rates = iotune_tests.get_sharded_worst_rates().get();
-                fmt::print("{} IOPS{}\n", uint64_t(read_iops.iops), accuracy_msg());
+                auto read_iops_rates = iotune_tests.get_sharded_worst_rates().get();
+                fmt::print("{} IOPS{}\n", uint64_t(read_iops.iops), accuracy_msg(read_iops_rates));
 
                 struct disk_descriptor desc;
                 desc.mountpoint = mountpoint;
