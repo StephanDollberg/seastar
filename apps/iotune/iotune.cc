@@ -61,6 +61,7 @@ logger iotune_logger("iotune");
 
 using iotune_clock = std::chrono::steady_clock;
 static thread_local std::default_random_engine random_generator(std::chrono::duration_cast<std::chrono::nanoseconds>(iotune_clock::now().time_since_epoch()).count());
+const auto WARMUP_PERIOD = 3s;
 
 void check_device_properties(fs::path dev_sys_file) {
     auto sched_file = dev_sys_file / "queue" / "scheduler";
@@ -218,15 +219,19 @@ struct row_stats {
 
 template <typename T>
 static row_stats get_row_stats_for(const std::vector<T>& v) {
-    if (v.size() == 0) {
+    const size_t drop_samples = WARMUP_PERIOD / 1s;
+    if (v.size() <= drop_samples) {
         return row_stats{0, 0.0, 0.0};
     }
 
-    double avg = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
-    double stdev = std::sqrt(std::transform_reduce(v.begin(), v.end(), 0.0,
-                std::plus<double>(), [avg] (auto& v) -> double { return (v - avg) * (v - avg); }) / v.size());
+    auto begin = v.begin() + drop_samples;
+    auto size = static_cast<size_t>(v.end() - begin);
 
-    return row_stats{ v.size(), avg, stdev };
+    double avg = std::accumulate(begin, v.end(), 0.0) / size;
+    double stdev = std::sqrt(std::transform_reduce(begin, v.end(), 0.0,
+                std::plus<double>(), [avg] (auto& v) -> double { return (v - avg) * (v - avg); }) / size);
+
+    return row_stats{ size, avg, stdev };
 }
 
 class invalid_position : public std::exception {
@@ -376,7 +381,7 @@ public:
 
     io_worker(size_t buffer_size, std::chrono::duration<double> duration, std::unique_ptr<request_issuer> reqs, std::unique_ptr<position_generator> pos, std::vector<unsigned>& rates)
         : _buffer_size(buffer_size)
-        , _start_measuring(iotune_clock::now() + std::chrono::duration<double>(10ms))
+        , _start_measuring(iotune_clock::now() + std::chrono::duration<double>(WARMUP_PERIOD))
         , _end_measuring(_start_measuring + duration)
         , _end_load(_end_measuring + 10ms)
         , _last_time_seen(_start_measuring)
