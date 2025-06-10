@@ -18,6 +18,8 @@ optional):
 * `read_bandwidth`: read bandwidth speed of the device
 * `write_iops`: write IOPS speed of the device
 * `write_bandwidth`: write bandwidth speed of the device
+* `duplex`: device is full duplex (i.e.: it can sustain maximum write and
+    read performance at the same time)
 
 
 Additionally the following optional properties can be added:

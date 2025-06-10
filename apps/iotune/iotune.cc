@@ -48,6 +48,8 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/fsqual.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/when_all.hh>
+#include <seastar/core/map_reduce.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/std-compat.hh>
@@ -588,29 +590,42 @@ public:
         });
     }
 
-    future<io_rates> write_random_data(size_t buffer_size, std::chrono::duration<double> duration) {
-        return _iotune_test_file.map_reduce0([buffer_size, this, duration] (test_file& tf) {
+    future<io_rates> write_random_data(std::ranges::range auto cpus, size_t buffer_size, std::chrono::duration<double> duration) {
+        auto map = [buffer_size, this, duration] (test_file& tf) {
             const auto shard_io_depth = per_shard_io_depth();
             if (shard_io_depth == 0) {
                 return make_ready_future<io_rates>();
             } else {
                 return tf.write_workload(buffer_size, test_file::pattern::random, shard_io_depth, duration, sharded_rates.local());
             }
-        }, io_rates(), std::plus<io_rates>());
+        };
+        return map_reduce_workload(cpus, std::move(map));
     }
 
-    future<io_rates> read_random_data(size_t buffer_size, std::chrono::duration<double> duration) {
-        return _iotune_test_file.map_reduce0([buffer_size, this, duration] (test_file& tf) {
+    future<io_rates> read_random_data(std::ranges::range auto cpus, size_t buffer_size, std::chrono::duration<double> duration) {
+        auto map = [buffer_size, this, duration] (test_file& tf) {
             const auto shard_io_depth = per_shard_io_depth();
             if (shard_io_depth == 0) {
                 return make_ready_future<io_rates>();
             } else {
                 return tf.read_workload(buffer_size, test_file::pattern::random, shard_io_depth, duration, sharded_rates.local());
             }
-        }, io_rates(), std::plus<io_rates>());
+        };
+        return map_reduce_workload(cpus, std::move(map));
     }
 
 private:
+    template <typename Fn>
+    future<io_rates> map_reduce_workload(std::ranges::range auto cpus, Fn&& map) {
+        auto wrapped_map = [this, map] (unsigned c) {
+            return smp::submit_to(c, [this, map] {
+                auto& inst = _iotune_test_file.local();
+                return std::invoke(map, inst);
+            });
+        };
+        return seastar::map_reduce(cpus, std::move(wrapped_map), io_rates(), std::plus<io_rates>());
+    }
+
     template <typename Fn>
     future<uint64_t> saturate(float rate_threshold, size_t buffer_size, std::chrono::duration<double> duration, Fn&& workload) {
         return _iotune_test_file.invoke_on(0, [this, rate_threshold, buffer_size, duration, workload] (test_file& tf) {
@@ -650,6 +665,7 @@ struct disk_descriptor {
     uint64_t write_bw;
     std::optional<uint64_t> read_sat_len;
     std::optional<uint64_t> write_sat_len;
+    bool duplex;
 };
 
 void string_to_file(sstring conf_file, sstring buf) {
@@ -682,6 +698,7 @@ void write_property_file(sstring conf_file, std::vector<disk_descriptor> disk_de
         out << YAML::Key << "read_bandwidth" << YAML::Value << desc.read_bw;
         out << YAML::Key << "write_iops" << YAML::Value << desc.write_iops;
         out << YAML::Key << "write_bandwidth" << YAML::Value << desc.write_bw;
+        out << YAML::Key << "duplex" << YAML::Value << desc.duplex;
         if (desc.read_sat_len) {
             out << YAML::Key << "read_saturation_length" << YAML::Value << *desc.read_sat_len;
         }
@@ -882,15 +899,35 @@ int main(int ac, char** av) {
 
                 fmt::print("Measuring random write IOPS: ");
                 std::cout.flush();
-                auto write_iops = iotune_tests.write_random_data(test_directory.minimum_io_size(), duration * 0.1).get();
+                auto write_iops = iotune_tests.write_random_data(smp::all_cpus(), test_directory.minimum_io_size(), duration * 0.1).get();
                 auto write_iops_rates = iotune_tests.get_sharded_worst_rates().get();
                 fmt::print("{} IOPS{}\n", uint64_t(write_iops.iops), accuracy_msg(write_iops_rates));
 
                 fmt::print("Measuring random read IOPS: ");
                 std::cout.flush();
-                auto read_iops = iotune_tests.read_random_data(test_directory.minimum_io_size(), duration * 0.1).get();
+                auto read_iops = iotune_tests.read_random_data(smp::all_cpus(), test_directory.minimum_io_size(), duration * 0.1).get();
                 auto read_iops_rates = iotune_tests.get_sharded_worst_rates().get();
                 fmt::print("{} IOPS{}\n", uint64_t(read_iops.iops), accuracy_msg(read_iops_rates));
+
+                bool full_duplex = false;
+                if (smp::count >= 2) {
+                    fmt::print("Checking full duplex: ");
+                    std::cout.flush();
+                    auto mid = smp::all_cpus().begin() + smp::all_cpus().size() / 2;
+                    auto read_cpus = std::ranges::subrange(smp::all_cpus().begin(), mid);
+                    auto write_cpus = std::ranges::subrange(mid, smp::all_cpus().end());
+                    auto read_iops_fut = iotune_tests.read_random_data(read_cpus, test_directory.minimum_io_size(), duration * 0.1);
+                    auto write_iops_fut = iotune_tests.write_random_data(write_cpus, test_directory.minimum_io_size(), duration * 0.1);
+                    auto [duplex_read_iops, duplex_write_iops] = when_all_succeed(std::move(read_iops_fut), std::move(write_iops_fut)).get();
+                    // If we get at least 90% of the perf we consider it full-duplex.
+                    bool full_read = duplex_read_iops.iops > read_iops.iops * 0.9;
+                    bool full_write = duplex_write_iops.iops > write_iops.iops * 0.9;
+                    full_duplex = full_read && full_write;
+                    fmt::print("{} wIOPS {} rIOPS full-duplex: {}\n",
+                            uint64_t(duplex_write_iops.iops), uint64_t(duplex_read_iops.iops), full_duplex);
+                } else {
+                    fmt::print("Skipping full duplex check, only one shard is available.\n");
+                }
 
                 struct disk_descriptor desc;
                 desc.mountpoint = mountpoint;
@@ -900,6 +937,7 @@ int main(int ac, char** av) {
                 desc.write_iops = write_iops.iops;
                 desc.write_bw = write_bw.bytes_per_sec;
                 desc.write_sat_len = write_sat;
+                desc.duplex = full_duplex;
                 disk_descriptors.push_back(std::move(desc));
             }
 
