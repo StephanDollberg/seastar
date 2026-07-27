@@ -192,8 +192,10 @@ public:
     };
 };
 
+// This makes calls to coroutine::without_preemption_check a safe elide
+// context, so its annotated argument can propagate to the wrapped coroutine.
 template<bool CheckPreempt, typename T>
-struct awaiter {
+struct [[nodiscard]] SEASTAR_CORO_AWAIT_ELIDABLE awaiter {
     seastar::future<T> _future;
 public:
     explicit awaiter(seastar::future<T>&& f) noexcept : _future(std::move(f)) { }
@@ -219,7 +221,7 @@ public:
 };
 
 template<bool CheckPreempt>
-struct awaiter<CheckPreempt, void> {
+struct [[nodiscard]] SEASTAR_CORO_AWAIT_ELIDABLE awaiter<CheckPreempt, void> {
     seastar::future<> _future;
 public:
     explicit awaiter(seastar::future<>&& f) noexcept : _future(std::move(f)) { }
@@ -253,14 +255,13 @@ auto operator co_await(future<T>&& f) noexcept {
 }
 
 namespace coroutine {
-/// Wrapper for a future which turns off checking for preemption
-/// when awaiting it in a coroutine.
-/// If constructed from a future, co_await-ing it will bypass
-/// checking if the task quota is depleted, which means that
-/// a ready future will be handled immediately.
-template<typename T> struct [[nodiscard]] without_preemption_check : public seastar::future<T> {
-    explicit without_preemption_check(seastar::future<T>&& f) noexcept : seastar::future<T>(std::move(f)) {}
-};
+/// Wait for a future without checking for preemption.
+///
+/// A ready future will be handled immediately.
+template<typename T>
+inline auto without_preemption_check(SEASTAR_CORO_AWAIT_ELIDABLE_ARGUMENT seastar::future<T>&& f) noexcept {
+    return internal::awaiter<false, T>(std::move(f));
+}
 
 /// Make a lambda coroutine safe for use in an outer coroutine with
 /// functions that accept continuations.
@@ -298,15 +299,6 @@ public:
 
 }
 
-/// Wait for a future without a preemption check
-///
-/// \param f a \c future<> wrapped with \c without_preemption_check
-template<typename T>
-auto operator co_await(coroutine::without_preemption_check<T> f) noexcept {
-    return internal::awaiter<false, T>(std::move(f));
-}
-
-
 } // seastar
 
 
@@ -317,4 +309,3 @@ class coroutine_traits<seastar::future<T>, Args...> : public seastar::internal::
 };
 
 } // std
-
